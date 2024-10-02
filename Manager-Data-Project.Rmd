@@ -1,0 +1,682 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+## We Begin by asking the following Questions:
+
+Which industry pays the most? \
+How does salary increase given years of experience?\
+How do salaries compare for the same role in different locations?\
+How much do salaries differ by gender and years of experience?\
+How do factors like race and education level correlate with salary?\
+
+
+### 1. Load the Data
+```{r}
+library(readxl)
+df <- read_excel("Ask A Manager Salary Survey 2021 (Responses).xlsx")
+colofnames = c("Timestamp", "Age_Range", "Industry", "Title", "Title_Context", "Annual_Salary", "Additional_Compensation", "Currency", "Other_Currency", "Additional_Income_Context", "Country_of_Work", "US_State", "City", "Overall_Work_Experience", "Work_Experience_in_Field", "Highest_Level_of_Education", "Gender", "Race")
+df <- as.data.frame(df)
+
+colnames(df) <- colofnames
+
+df
+```
+### 2. Handle Nulls
+```{r}
+colSums(is.na(df))
+```
+For our purposes, we do not care about the "Title Context" column. We can also ignore the Additional Income Context column as most cases do not feature this, and they vary from company to company. Will most likely not provide any meaningful context to our data. 
+Most of the other NAs can be handled through column combination, adding an "N/A" or "None"
+
+We can begin by observing that both salary and additional compensation are integers. Thus, we can change any missing value to a 0, then sum the two values into its own column
+
+```{r}
+library(tidyverse)
+
+df$Annual_Salary <- as.integer(df$Annual_Salary)
+
+df = df %>% mutate(Industry = replace_na(Industry, "Other"))
+
+df$Additional_Compensation <- as.integer(df$Additional_Compensation)
+
+df = df %>% mutate(Additional_Compensation = replace_na(Additional_Compensation, 0))
+
+df
+```
+```{r}
+# Create new column that adds annual salary and compensation to one value
+df$TotalSalary <- rowSums(df[,c("Annual_Salary", "Additional_Compensation")])
+
+# Check for Remaining NAs
+colSums(is.na(df))
+
+df <- df %>% filter(!is.na(df$TotalSalary))
+sum(is.na(df$TotalSalary))
+```
+There is 1 NA in the Total Salary and Annual Salary field. This is due to the number in the data set being so absurdly high that it is being recorded as an NA. We can treat this response as fake and drop it from our data set
+
+Now we handle NAs in the US State field
+```{r}
+df = df %>% mutate(US_State = replace_na(US_State, "N/A"))
+```
+
+The 9 city null values provide a small subset that is not significantly large enough to matter. Thus, if we were to do analysis at a city level, we would omit these 9.
+Now for Highest Level of Education
+
+```{r}
+df = df %>% mutate(Highest_Level_of_Education = replace_na(Highest_Level_of_Education, "Non-Response"))
+```
+
+
+```{r}
+# For Gender
+df = df %>% mutate(Gender = replace_na(Gender, "Non-Response"))
+```
+
+
+```{r}
+# For Race
+df = df %>% mutate(Race = replace_na(Race, "Non-Response"))
+```
+
+
+### 3. Cleaning Messy Data
+
+Now we observe the currencies that we have as a list
+
+What we are looking for is how many different currencies we have a significant sample size of (>25 or >30 depending on preference) to be able to draw conclusions
+
+```{r}
+# Begin by finding all unique currencies
+list_currency <- function(currency_column) {
+  unique_currencies <- unique(currency_column)
+  return(unique_currencies)
+}
+
+list_currency(df$Currency)
+```
+
+```{r}
+# Check the other currency column
+df %>%  select(Title, Country_of_Work,Currency, Other_Currency) %>% filter(complete.cases(.))
+```
+
+The Other Currency Column is extremely messy. There are only 216 rows so one option is to remove these entries. Another option is to create a new column where the currency is listed as it is in the currency column, then, if "Other" was listed, we list the other currency
+
+```{r}
+df$new_currency <- ifelse(df$Currency == "Other", df$Other_Currency, df$Currency)
+
+# For Data Frame Checking
+#df$new_currency
+#list_currency(df$new_currency)
+
+currency_counts <- table(df$new_currency)
+print(currency_counts)
+```
+
+```{r}
+usvariation = c("American Dollars", "US Dollar", "USD", "Equity")
+ausvariation = c("AUD", "AUD Australian", "AUD/NZD", "Australian Dollars", "NZD")
+eurvariation = c("EUR","Euro")
+```
+
+Above are the variations of the only combinations that provide us with a large enough sample size to give us meaningful insight
+Thus, in our data frame we can combine these variations into consistent classifications
+
+```{r}
+df <- df %>%
+  mutate(cleaned_currency = case_when(
+    new_currency %in% usvariation ~ "USD",
+    new_currency %in% ausvariation ~ "AUD",
+    new_currency %in% eurvariation ~ "EUR",
+    TRUE ~ new_currency  # Leave other currency unchanged
+  ))
+
+currency_counts <- table(df$cleaned_currency)
+currency_df <- as.data.frame(currency_counts)
+
+# Rename columns for clarity
+colnames(currency_df) <- c("currency", "frequency")
+
+# Filter rows where frequency > 25
+filtered_df <- currency_df[currency_df$frequency > 25, ]
+
+# Sort by frequency in descending order
+sorted_df <- filtered_df[order(-filtered_df$frequency), ]
+
+# View the result
+print(sorted_df)
+```
+Now we trim our data down to only those who use USD, AUD, CAD, EUR, GBP, SEK, and CHF as these are the samples n > 30.
+```{r}
+wanted_currencies = c("USD", "AUD", "EUR", "GBP", "CAD", "SEK", "CHF")
+
+workingdf <- df %>%  select(Age_Range, Industry, Title, Title_Context, Country_of_Work, US_State, City, Overall_Work_Experience, Work_Experience_in_Field, Highest_Level_of_Education, Gender, Race, TotalSalary, cleaned_currency) %>% filter(cleaned_currency %in% wanted_currencies)
+
+# For Data Frame Checking
+#workingdf
+```
+
+Now we translate all currencies to USD. Since this is for project purposes I will be using a static method for conversion rates
+An Automatic conversion rate could be coded using an API and API keys
+
+```{r}
+
+conversion_rates = c("USD" = 1, "CAD" = 0.74, "EUR" = 1.12, "AUD" = 0.68, "SEK" = 0.098, "CHF" = 1.18, "GBP" = 1.34)
+
+convert_salary_to_usd <- function(salary, currency) {
+  return(salary * conversion_rates[currency])
+}
+
+workingdf <- workingdf %>%
+  mutate(TranslatedSalary = mapply(convert_salary_to_usd, TotalSalary, cleaned_currency))
+
+#workingdf
+```
+Now we have fully translated to USD salaries and are able to begin analyzing salary data. We can now check other columns for abnormalities
+
+```{r}
+newdf <- workingdf %>% select(Age_Range, Industry, Title, Title_Context, Country_of_Work, US_State, City, Overall_Work_Experience, Work_Experience_in_Field, Highest_Level_of_Education, Gender, Race, cleaned_currency, TotalSalary, TranslatedSalary)
+
+colSums(is.na(newdf))
+```
+```{r}
+# Handle Industry Data Cleaning
+newdf$Industry <- tolower(newdf$Industry)
+industry_counts = table(newdf$Industry)
+
+# I Commented the table; un-comment to view the messy results
+#industry_counts
+```
+
+Unfortunately our Industry data is extremely messy.
+
+However, we have enough here that we can exclude the other labelled fields and then select the proper sample size (>30) sectors
+
+Let's rewrite this code to solve in a vectorized format such that it will run faster and more efficiently
+
+```{r}
+library(dplyr)
+library(stringdist)
+
+# Function to extract potential keywords from a column of text values
+extract_keywords <- function(text_column) {
+  
+  # Convert to lowercase for uniformity
+  text_column <- tolower(text_column)
+  
+  # Remove special characters
+  text_column <- gsub("[^a-zA-Z\\s]", "", text_column)
+ 
+  # Split each entry into individual words
+  words <- unlist(strsplit(text_column, "\\s+"))
+  
+  # Remove any empty strings (if present)
+  words <- words[words != ""]
+
+  # Count the frequency of each word
+  word_freq <- table(words)
+  
+  # Convert to a sorted data frame for easier inspection
+  keyword_df <- as.data.frame(sort(word_freq, decreasing = TRUE))
+  colnames(keyword_df) <- c("keyword", "frequency")
+  
+  return(keyword_df)
+}
+
+add_keywords <- function(text_column) {
+  
+  # Convert to lowercase for uniformity
+  text_column <- tolower(text_column)
+  
+  # Remove special characters (optional, but helpful for cleanup)
+  text_column <- gsub("[^a-zA-Z\\s]", "", text_column)
+  
+  # Split each entry into individual words
+  words <- unlist(strsplit(text_column, "\\s+"))
+  
+  # Remove any empty strings (if present)
+  words <- words[words != ""]
+
+  keyword_column <- words
+  return(keyword_column)
+}
+
+
+
+potential_keywords <- extract_keywords(newdf$Industry)
+#to view potential keywords
+#print(potential_keywords)
+```
+
+```{r}
+# Add Keywords to Data Frame
+
+newdf$Keywords <- add_keywords(newdf$Industry)
+
+newdf %>% select(Industry,Keywords)
+```
+
+Now we can filter our data set by high frequency.
+
+We can choose a threshold for frequency to filter our data set into groups. Since there are many instances of frequencies in the range of 1-3, it might be too difficult to properly filter the data accurately into their groups. Using a matching algorithm such as fuzzy matching would be a possibility but due to its inexactness, it is better to take exact, significant sample sizes as opposed to risking a high error in sorting.
+
+```{r}
+filtered_df <- subset(potential_keywords, frequency >= 25)
+
+# View the number of filtered entries
+sum(filtered_df$frequency)
+keywordarray = c()
+
+# Add the keywords to an array
+for(names in filtered_df$keyword){
+  keywordarray <- c(keywordarray,names)
+}
+
+# Check keyword array
+keywordarray
+```
+
+```{r}
+# Assign a group to each keyword of frequency >= 25
+keyworddf <- data.frame(
+  Keywords = keywordarray,
+  group = c("Technology","Higher Education","Non Profits","Health Care","Government","Financial Sector","Engineering & Manufacturing","Law","Marketing & Pr", "Business & Consulting","Primary/Secondary Education", "Media & Entertainment", "Insurance", "Retail", "HR", "Construction", "Art & Design", "Utilities", "Transportation", "Sales", "Social Work", "Hospitality", "Media & Entertainment", "Agriculture and Forestry", "Leisure & Tourism", "Miscellaneous", "Publishing","Library","Library","BioTech & Pharmaceuticals","Library","Engineering & Manufacturing","Law","Research","BioTech & Pharmaceuticals","Engineering & Manufacturing","BioTech & Pharmaceuticals", "Real Estate", "Library"),
+  stringsAsFactors = FALSE
+)
+
+# Note: Do not run this chunk by itself multiple times, it breaks the left_join function
+newdf <- newdf %>% left_join(keyworddf, by = "Keywords")
+newdf <- newdf %>% mutate(group = coalesce(group, "Miscellaneous"))
+
+
+newdf_with_groups <- newdf %>% select(Age_Range, Industry, Title, Country_of_Work, US_State, City, Overall_Work_Experience, Work_Experience_in_Field, Highest_Level_of_Education, Gender, Race, cleaned_currency, TranslatedSalary, group)
+
+#View df
+newdf_with_groups
+```
+
+Just need to clean the country column now
+
+```{r}
+#table(newdf_with_groups$`Country of Work`)
+# Use the extract keywords function to extract countries
+country_keywords <- extract_keywords(newdf_with_groups$Country_of_Work)
+
+#Keyword Frequency Table
+country_keywords
+```
+
+Once again we will use the mapping strategy
+
+It does not make sense to go country by country since only a select few are of significant size to justify keeping
+
+Using the information that we know, we can break these up and sort by original currency.
+
+In that case, we have an America, Canada, Great Britain, Europe and Australia/New Zealand Region that will provide us with meaningful differences while not running the risk of a string matching function giving incorrect matches. In this case, we will place Sweden and Switzerland in the Europe section.
+
+```{r}
+regiondf = data.frame(
+  cleaned_currency = wanted_currencies,
+  Region = c("United States", "Australia", "Europe","Great Britain", "Canada", "Europe", "Europe"),
+  stringsAsFactors = FALSE
+)
+newdf_with_groups <- merge(newdf_with_groups, regiondf, by = "cleaned_currency", all.x = TRUE)
+```
+
+One Last step we can take is to sort out all of the entries where USD was their listed currency but they are not US country
+Now, the country column being as bad as it is, we will lose some of the united states entries but, if we use our mapping strategy for the most common variants of the country, we can retain as many as possible
+
+```{r}
+#Filter for Keywrods beginning with U
+Unitedstatesfreq <- country_keywords
+Unitedstatesfreq <- Unitedstatesfreq %>% filter(grepl("^u", keyword))
+Unitedstatesfreq <- Unitedstatesfreq %>% filter(!keyword %in% c("uk","unitedkingdom","uae","uganda","ukraine","unitedarabemirates"))
+
+#check results
+#Unitedstatesfreq
+
+UnitedStatesSpellings <- Unitedstatesfreq$keyword
+UnitedStatesSpellings
+```
+
+```{r}
+normalize_country <- function(x) {
+  x <- tolower(x)                      # Convert to lowercase
+  x <- str_replace_all(x, "[^a-z]", "") # Remove non-alphabetic characters (special chars and spaces)
+  return(x)
+}
+
+# Normalize the country column
+newdf_with_groups$normalized_country <- normalize_country(newdf_with_groups$Country_of_Work)
+
+# Replace the normalized variations (and the "America" variation)
+newdf_with_groups$Country_of_Work[newdf_with_groups$normalized_country %in% UnitedStatesSpellings] <- "United States"
+newdf_with_groups$Country_of_Work[newdf_with_groups$normalized_country == "america"] <- "United States"
+
+# Drop the helper 'normalized_country' column
+newdf_with_groups <- newdf_with_groups %>% select(-normalized_country)
+
+# View the result
+#newdf_with_groups %>% filter(Region == "United States" & `US State` == "N/A")
+
+# Now we have that our country of work is United states if they are US
+# This means we can now filter for region and know that our United States region entries are in the United States
+
+Finaldf <- newdf_with_groups %>% filter(!Region == "United States" | (Region == "United States" & Country_of_Work == "United States"))
+Finaldf <- Finaldf %>% select(-cleaned_currency)
+Finaldf <- Finaldf %>% select(-Country_of_Work)
+Finaldf <- Finaldf %>% select(-Industry)
+Finaldf
+```
+
+We have now gone from a messy 28075 entry data set to a cleaned and organized 27662 entry data set; losing 413 entries in the process of cleaning or roughly 1.5% of entries. This should be considered an adequate amount of entries to lose in a data set this large.
+
+### 4. Data Analysis
+
+Let's Look back to the original questions:
+
+### Which industry pays the most?
+How does salary increase given years of experience?\
+How do salaries compare for the same role in different locations?\
+How much do salaries differ by gender and years of experience?\
+How do factors like race and education level correlate with salary?\
+
+```{r}
+# Which industry pays the most?
+# We begin by finding the top 5 industries by average and median
+top_industries_mean <- Finaldf %>%
+  group_by(group) %>%                          # Group data by 'Industry'
+  summarise(
+    mean_salary = mean(TranslatedSalary, na.rm = TRUE), # Calculate mean salary
+  ) %>%
+  arrange(desc(mean_salary)) %>% slice_head(n=5)
+  # Sort by mean salary in descending order
+
+top_industries_median <- Finaldf %>%
+  group_by(group) %>%                          # Group data by 'Industry'
+  summarise(
+    median_salary = median(TranslatedSalary, na.rm = TRUE) # Calculate median salary
+  ) %>%
+  arrange(desc(median_salary)) %>% slice_head(n=5)
+
+top_industries_mean
+top_industries_median
+
+meanFinaldf <- Finaldf %>% filter(group %in% top_industries_mean$group)
+medianFinaldf <- Finaldf %>% filter(group %in% top_industries_median$group)
+
+
+
+boxplot(TranslatedSalary ~ group, meanFinaldf)
+#we have an issue with outliers, clearly.
+```
+
+
+While we have no negative values, we have some outlier values that will negatively impact our data set and border on being untrue.
+One method would be to set a cap. Above, we see a line at 1 million would roughly exclude only the most extreme outliers, with the exception of technology
+
+
+
+```{r}
+# See how it affects our top 5
+df_capped_mean <- meanFinaldf %>%
+  mutate(
+    TranslatedSalary = ifelse(TranslatedSalary < 0, 0, TranslatedSalary),
+    TranslatedSalary = ifelse(TranslatedSalary > 500000, 500000, TranslatedSalary)
+  )
+
+df_capped_med <- medianFinaldf %>%
+  mutate(
+    TranslatedSalary = ifelse(TranslatedSalary < 0, 0, TranslatedSalary),
+    TranslatedSalary = ifelse(TranslatedSalary > 500000, 500000, TranslatedSalary)
+  )
+
+top_industries_mean <- df_capped_mean %>%
+  group_by(group) %>%                         
+  summarise(
+    mean_salary = mean(TranslatedSalary, na.rm = TRUE),
+  ) %>%
+  arrange(desc(mean_salary)) %>% slice_head(n=5)
+  
+
+top_industries_median <- df_capped_med %>%
+  group_by(group) %>%                         
+  summarise(
+    median_salary = median(TranslatedSalary, na.rm = TRUE) 
+  ) %>%
+  arrange(desc(median_salary)) %>% slice_head(n=5)
+
+top_industries_mean
+top_industries_median
+```
+Here we see that the order of our top 5 by mean changes, but as a whole, our top 5 industries by mean stay the same. Median, of course, would not be affected
+
+```{r}
+boxplot(TranslatedSalary ~ group, df_capped_mean)
+```
+
+Lets try this instead with setting our bounds to 1.5 times IQR
+
+```{r}
+Q1 <- quantile(meanFinaldf$TranslatedSalary, 0.25, na.rm = TRUE)
+Q3 <- quantile(meanFinaldf$TranslatedSalary, 0.75, na.rm = TRUE)
+IQR <- Q3 - Q1
+
+# Define outliers as points outside 1.5 * IQR from the quartiles
+lower_bound <- Q1 - 1.5 * IQR
+upper_bound <- Q3 + 1.5 * IQR
+
+
+df_capped_mean <- meanFinaldf %>%
+  mutate(
+    TranslatedSalary = ifelse(TranslatedSalary < lower_bound, lower_bound, TranslatedSalary),
+    TranslatedSalary = ifelse(TranslatedSalary > upper_bound, upper_bound, TranslatedSalary)
+  )
+
+df_capped_med <- medianFinaldf %>%
+  mutate(
+    TranslatedSalary = ifelse(TranslatedSalary < lower_bound, lower_bound, TranslatedSalary),
+    TranslatedSalary = ifelse(TranslatedSalary > upper_bound, upper_bound, TranslatedSalary)
+  )
+boxplot(TranslatedSalary ~ group, df_capped_mean)
+boxplot(TranslatedSalary ~ group, df_capped_med)
+```
+
+We can see that in multiple instances, technology has the highest median salary across the top 5 groups by mean and median. As well, technology provides both the highest floor and ceiling by Interquartile range. A common statistical technique is to take a line through all of the boxes to see if there is at least one point of total overlap. In this case we would be able to directly below the technology median, implying that there might not be significant distribution across the top 5 Industries. However, our measures of central tendency indicate that technology is above the other industries. So, if we were to want a definitive answer for which industry pays most; on average, the technology industry pays the most.
+
+```{r}
+# Checking ANOVA, Kruskal-Wallis and Tukey
+result <- aov(TranslatedSalary ~ group, data = df_capped_mean)
+summary(result)
+
+shapiro.test(sample(meanFinaldf$TranslatedSalary,5000))
+kruskal.test(TranslatedSalary ~ group, data = df_capped_mean)
+TUKEY <- TukeyHSD(result)
+
+tukey_df <- as.data.frame(TUKEY$group)
+tukey_significant <- tukey_df[tukey_df$`p adj` < 0.05, ]
+tukey_significant
+```
+Using the Tukey Test, we can see that when compared to all of the other industries in the top 5 by mean, the distribution of Technology is significantly different. Thus, we are able to conclude that Technology is the Industry that pays the best.
+
+
+```{r}
+result <- aov(TranslatedSalary ~ group, data = df_capped_med)
+summary(result)
+
+shapiro.test(sample(medianFinaldf$TranslatedSalary,5000))
+kruskal.test(TranslatedSalary ~ group, data = df_capped_med)
+TUKEY <- TukeyHSD(x=result, conf.level=0.95)
+TUKEY
+
+tukey_df <- as.data.frame(TUKEY$group)
+tukey_significant <- tukey_df[tukey_df$`p adj` < 0.05, ]
+tukey_significant
+```
+Similar Results for median strengthens our result
+
+### How does salary increase given years of experience?
+
+We only have ranges for years of experience, not concrete numeric values
+We could choose to use the minimum of each threshold and plot correlation
+We also can once again use a box plot visualization to check for differences
+
+
+```{r}
+Q1 <- quantile(Finaldf$TranslatedSalary, 0.25, na.rm = TRUE)
+Q3 <- quantile(Finaldf$TranslatedSalary, 0.75, na.rm = TRUE)
+IQR <- Q3 - Q1
+
+# Define outliers as points outside 1.5 * IQR from the quantiles
+lower_bound <- Q1 - 1.5 * IQR
+upper_bound <- Q3 + 1.5 * IQR
+
+
+Finaldf_capped <- Finaldf %>%
+  mutate(
+    TranslatedSalary = ifelse(TranslatedSalary < lower_bound, lower_bound, TranslatedSalary),  # Cap lower outliers
+    TranslatedSalary = ifelse(TranslatedSalary > upper_bound, upper_bound, TranslatedSalary)   # Cap upper outliers
+  )
+#unique(Finaldf_capped$Work_Experience_in_Field)
+
+Finaldf_capped$Work_Experience_in_Field <- factor(Finaldf_capped$Work_Experience_in_Field, levels = c("1 year or less", "2 - 4 years", "5-7 years", "8 - 10 years", "11 - 20 years", "21 - 30 years", "31 - 40 years", "41 years or more"))
+
+#unique(Finaldf_capped$Work_Experience_in_Field)
+boxplot(TranslatedSalary ~ Work_Experience_in_Field, Finaldf_capped)
+```
+
+```{r}
+#unique(Finaldf_capped$Overall_Work_Experience)
+
+Finaldf_capped$Overall_Work_Experience <- factor(Finaldf_capped$Overall_Work_Experience, levels = c("1 year or less", "2 - 4 years", "5-7 years", "8 - 10 years", "11 - 20 years", "21 - 30 years", "31 - 40 years", "41 years or more"))
+
+
+boxplot(TranslatedSalary ~ Overall_Work_Experience, Finaldf_capped)
+
+```
+
+We can see the median values increase steadily from the 1 year or less group to the 21-30 years experience before flattening out
+
+If we care to get into specifics, we can once again use the Tukey test as we did above to check for differences between groups. However, for the purposes of this, we can see that up until around the 21-30 range, salary increases steadily before plateauing
+
+### How do salaries compare for the same role in different locations?
+For this we can use industry and region and compare
+Lets once again move back to our dataset of just the top 5 industries by mean
+
+```{r}
+result.aov <- aov(TranslatedSalary ~ group * Region, data = df_capped_mean)
+tukey_result <- TukeyHSD(result.aov)
+# interaction_term_results <- tukey_result$`group:Region`
+# 
+# tukey_interaction_df <- as.data.frame(interaction_term_results)
+# 
+# # Show significant results for Region (p-value < 0.05)
+# significant_interaction <- tukey_interaction_df[tukey_interaction_df$`p adj` < 0.05, ]
+# 
+# print(significant_interaction)
+
+tukey_result <- TukeyHSD(result.aov)
+
+tukey_df <- as.data.frame(tukey_result$`group:Region`)
+
+# Add a column with the comparison labels
+tukey_df$comparison <- rownames(tukey_df)
+
+filter_same_industry_diff_region <- function(comp) {
+  # Split the comparison label at the '-'
+  split_comparison <- unlist(strsplit(comp, "-"))
+  
+  # Further split at ':' to separate industry and region
+  industry_region_1 <- unlist(strsplit(split_comparison[1], ":"))
+  industry_region_2 <- unlist(strsplit(split_comparison[2], ":"))
+  
+  # Check if the industries are the same and regions are different
+  return(industry_region_1[1] == industry_region_2[1] && industry_region_1[2] != industry_region_2[2])
+}
+
+# Apply the filtering function to the comparison column
+tukey_filtered <- tukey_df[sapply(tukey_df$comparison, filter_same_industry_diff_region), ]
+
+# Display the filtered results
+#print(tukey_filtered)
+
+tukey_filtered_significant <- tukey_filtered[tukey_filtered$`p adj` < 0.05, ]
+
+# Display the filtered results
+print(tukey_filtered_significant)
+```
+
+For technology, significant differences between United States and all of our other regions
+Marketing & Pr differs for Canada and all regions except Europe
+Business & Consulting differs for United States-Canada and United States-Europe but not Great Britain or Australia
+
+
+Interestingly, there is no difference by region for Biotech & Pharmaceuticals and Sales
+
+```{r}
+par(mfrow = c(2,3))
+for(i in 1:5){
+techgroup <- subset(df_capped_mean, group == top_industries_mean$group[i])
+boxplot(TranslatedSalary ~ Region, techgroup, las=2)
+title(main = top_industries_mean$group[i])
+}
+```
+
+The visualizations help our understanding of where the differences are
+Biotech & Pharmaceuticals seems to not have significant enough sample size in each region to be considered
+
+Our next question was: How much do salaries differ by gender and years of experience?
+This question is actually solved in the similar processes as before with box plots and tukey tests, thus we move on to our last question
+
+### How do factors like race and education level correlate with salary?
+
+We solve this by creating a linear model
+
+```{r}
+model <- lm(TranslatedSalary ~ Age_Range + group + Region + Race + Gender + Highest_Level_of_Education + Overall_Work_Experience + Work_Experience_in_Field, data = Finaldf_capped)
+#summary(model)
+#Not a very useful output
+
+# Sort for race that is more frequent, will not account for 
+race_counts <- table(Finaldf_capped$Race)
+#print(race_counts)
+
+race_counts <- as.data.frame(race_counts)
+race_counts <- race_counts %>% filter(Freq > 25)
+#race_counts
+
+Finaldf_capped_race <- Finaldf_capped %>% filter(Race %in% race_counts$Var1)
+
+model <- lm(TranslatedSalary ~ Age_Range + group + Region + Race + Gender + Highest_Level_of_Education + Overall_Work_Experience + Work_Experience_in_Field, data = Finaldf_capped_race)
+summary(model)
+```
+
+Our model tells us that, with all variables being considered, all answered levels of education are significant in the model, same with Work Experience in the field. For race, only some but not all races are significant. It is worth noting, the R-Squared of the model is about 0.4, meaning that a strictly linear model only explains 40% of the variance in the data set. Further exploration into the data by column would be necessary to understand which transformations may be necessary to properly model the data. As of right now though, this is unimportant.
+
+The coefficients indicate the positive/negative effect our levels have on salary. For education, all levels above high school education provide a significant positive effect on salary.
+For race, the only significant positive effect on salary is for "Asian or Asian American", all other significant effects by race are negative. That is, all other races are correlated with lower salary.
+
+There is still more cleaning we could do but this will suffice as an exploratory data analysis project
+
+## 5. Conclusion
+
+Setting off to do this project, I sought out to answer some basic questions about this dataset of manager salaries:
+
+Which industry pays the most? \
+How does salary increase given years of experience?\
+How do salaries compare for the same role in different locations?\
+How much do salaries differ by gender and years of experience?\
+How do factors like race and education level correlate with salary?\
+
+What we found is that the Technology industry pays the greatest and that specifically in the US pays greater than other regions
+
+Salary increases as year of experience increases and plateaus at around the 21st year of experience both overall and in the field
+
+We decided to skip the fourth question as it would have been a replication of the same methods used before
+
+Finally, race does not seem to have a significant effect on salary with a few exceptions. For education level, high school education being the highest has a significant negative effect on salary while all higher levels of education provides a significant positive effect
